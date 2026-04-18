@@ -11,7 +11,7 @@ export default {
     }
 
     if (url.pathname === '/api/health') {
-      return Response.json({ ok: true, model: 'raphael-basic', version: '3.0-ipspoof' });
+      return Response.json({ ok: true, model: 'raphael-basic', version: '3.1-debug' });
     }
 
     if (request.method === 'POST' && url.pathname === '/api/generate') {
@@ -24,14 +24,8 @@ export default {
 
 const USER_AGENTS = [
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36',
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36',
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36',
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36',
   'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36',
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0',
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0',
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15',
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15',
 ];
 
 function pickRandom(arr) {
@@ -65,19 +59,15 @@ async function fetchWithTimeout(url, options, timeoutMs = 30000) {
 function buildHeaders(session, extra = {}) {
   return {
     'User-Agent': session.ua,
-    'Accept': '*/*',
+    'Accept': 'application/json, text/plain, */*',
     'Accept-Language': 'en-US,en;q=0.9',
     'Origin': 'https://raphael.app',
     'Referer': 'https://raphael.app/',
-    'Sec-Ch-Ua': '"Google Chrome";v="135", "Not-A.Brand";v="8"',
-    'Sec-Ch-Ua-Mobile': '?0',
-    'Sec-Ch-Ua-Platform': '"Windows"',
     'Sec-Fetch-Dest': 'empty',
     'Sec-Fetch-Mode': 'cors',
     'Sec-Fetch-Site': 'same-origin',
+    // Fake IP Headers (Kuch firewalls inko block karti hain, isliye limited rakha hai)
     'X-Forwarded-For': session.ip,
-    'X-Real-IP': session.ip,
-    'Client-IP': session.ip,
     ...(session.cookies ? { 'Cookie': session.cookies } : {}),
     ...extra,
   };
@@ -105,15 +95,10 @@ async function getFreshSession(session) {
 
 async function generateFromRaphael(prompt, aspect, quantity) {
   const session = createSession();
-  const maxRetries = 3;
+  const maxRetries = 2;
+  let lastErrorLog = "";
 
   for (let attempt = 0; attempt < maxRetries; attempt++) {
-    if (attempt > 0) {
-      session.ip = generateIPv4();
-      session.ua = pickRandom(USER_AGENTS);
-      session.cookies = '';
-    }
-
     await getFreshSession(session);
 
     try {
@@ -137,7 +122,6 @@ async function generateFromRaphael(prompt, aspect, quantity) {
         
         for (const line of lines) {
           try {
-            // FIX: Safely handles 'data: {json}' SSE format or standard NDJSON
             const cleanLine = line.replace(/^data:\s*/, '').trim();
             if (cleanLine === '[DONE]' || !cleanLine) continue;
             
@@ -146,47 +130,39 @@ async function generateFromRaphael(prompt, aspect, quantity) {
               images.push({
                 url: data.url.startsWith('http') ? data.url : `https://raphael.app${data.url}`,
                 seed: data.seed || 0,
-                width: data.width || 0,
-                height: data.height || 0,
               });
             }
           } catch {}
         }
         
-        // FIX: Also checks if API responded with single JSON object instead of lines
         if (images.length === 0) {
           try {
              const fallbackData = JSON.parse(text);
-             if (fallbackData.url) {
-               images.push({
-                  url: fallbackData.url.startsWith('http') ? fallbackData.url : `https://raphael.app${fallbackData.url}`,
-                  seed: fallbackData.seed || 0,
-                  width: fallbackData.width || 0,
-                  height: fallbackData.height || 0,
-               });
-             } else if (fallbackData.images) {
-                fallbackData.images.forEach(img => {
-                   if(img.url) images.push({ url: img.url.startsWith('http') ? img.url : `https://raphael.app${img.url}`, seed: img.seed||0 });
-                });
-             }
+             if (fallbackData.url) images.push({ url: fallbackData.url.startsWith('http') ? fallbackData.url : `https://raphael.app${fallbackData.url}`, seed: fallbackData.seed || 0 });
+             else if (fallbackData.images) fallbackData.images.forEach(img => { if(img.url) images.push({ url: img.url.startsWith('http') ? img.url : `https://raphael.app${img.url}`, seed: img.seed||0 }); });
           } catch {}
         }
 
-        if (images.length > 0) return images;
+        if (images.length > 0) return { images };
+      } else {
+        // ERROR CATCHING LAGA DIYA HAI
+        const errText = await resp.text();
+        lastErrorLog = `HTTP ${resp.status}: ${errText.substring(0, 100)}`;
       }
 
       if (resp.status === 429) {
-        await sleep(1500 * (attempt + 1));
+        await sleep(1500);
         continue;
       }
-
+      
       await sleep(1000);
-    } catch {
-      if (attempt < maxRetries - 1) await sleep(2000);
+    } catch (err) {
+      lastErrorLog = `Fetch Error: ${err.message}`;
+      await sleep(1000);
     }
   }
 
-  return null;
+  return { _error: lastErrorLog };
 }
 
 async function handleGenerate(request) {
@@ -199,17 +175,18 @@ async function handleGenerate(request) {
 
   const { prompt, aspect, quantity } = body;
 
-  if (!prompt || prompt.trim().length < 3) {
-    return Response.json({ error: 'Prompt must be at least 3 characters' }, { status: 400 });
+  const result = await generateFromRaphael(prompt.trim(), aspect, quantity);
+
+  if (result && result._error) {
+    // AB UI PAR ASLI ERROR DIKHEGA
+    return Response.json({ error: `Raphael API Blocked us -> ${result._error}` }, { status: 502 });
   }
 
-  const images = await generateFromRaphael(prompt.trim(), aspect, quantity);
-
-  if (!images || images.length === 0) {
-    return Response.json({ error: 'Generation failed after retries. Try again.' }, { status: 502 });
+  if (!result || !result.images || result.images.length === 0) {
+    return Response.json({ error: 'No images returned from API.' }, { status: 502 });
   }
 
-  return Response.json({ success: true, data: { images } });
+  return Response.json({ success: true, data: { images: result.images } });
 }
 
 function sleep(ms) {
