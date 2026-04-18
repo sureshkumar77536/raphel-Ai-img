@@ -11,7 +11,7 @@ export default {
     }
 
     if (url.pathname === '/api/health') {
-      return Response.json({ ok: true, model: 'raphael-basic', version: '3.1-debug' });
+      return Response.json({ ok: true, model: 'raphael-basic', version: '3.2-bypass-429' });
     }
 
     if (request.method === 'POST' && url.pathname === '/api/generate') {
@@ -26,6 +26,7 @@ const USER_AGENTS = [
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36',
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36',
   'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0',
 ];
 
 function pickRandom(arr) {
@@ -35,7 +36,7 @@ function pickRandom(arr) {
 function generateIPv4() {
   const octet = () => Math.floor(Math.random() * 254) + 1;
   let a = octet();
-  while (a === 10 || a === 127 || a === 192) a = octet();
+  while (a === 10 || a === 127 || a === 192 || a === 172 || a === 104) a = octet();
   return `${a}.${octet()}.${octet()}.${octet()}`;
 }
 
@@ -66,8 +67,12 @@ function buildHeaders(session, extra = {}) {
     'Sec-Fetch-Dest': 'empty',
     'Sec-Fetch-Mode': 'cors',
     'Sec-Fetch-Site': 'same-origin',
-    // Fake IP Headers (Kuch firewalls inko block karti hain, isliye limited rakha hai)
+    // Aggressive Spoofing Headers for WAF Bypass
     'X-Forwarded-For': session.ip,
+    'X-Real-IP': session.ip,
+    'Client-IP': session.ip,
+    'True-Client-IP': session.ip,
+    'CF-Connecting-IP': session.ip,
     ...(session.cookies ? { 'Cookie': session.cookies } : {}),
     ...extra,
   };
@@ -95,14 +100,24 @@ async function getFreshSession(session) {
 
 async function generateFromRaphael(prompt, aspect, quantity) {
   const session = createSession();
-  const maxRetries = 2;
+  const maxRetries = 3;
   let lastErrorLog = "";
 
   for (let attempt = 0; attempt < maxRetries; attempt++) {
+    // If it's a retry, wipe identity completely to bypass WAF
+    if (attempt > 0) {
+      session.ip = generateIPv4();
+      session.ua = pickRandom(USER_AGENTS);
+      session.cookies = '';
+    }
+
     await getFreshSession(session);
 
+    // Cache buster to stop firewall from blocking repeated URLs
+    const targetUrl = `https://raphael.app/api/generate-image?_cb=${Date.now()}${Math.floor(Math.random() * 1000)}`;
+
     try {
-      const resp = await fetchWithTimeout('https://raphael.app/api/generate-image', {
+      const resp = await fetchWithTimeout(targetUrl, {
         method: 'POST',
         headers: buildHeaders(session, { 'Content-Type': 'application/json' }),
         body: JSON.stringify({
@@ -145,20 +160,20 @@ async function generateFromRaphael(prompt, aspect, quantity) {
 
         if (images.length > 0) return { images };
       } else {
-        // ERROR CATCHING LAGA DIYA HAI
         const errText = await resp.text();
         lastErrorLog = `HTTP ${resp.status}: ${errText.substring(0, 100)}`;
       }
 
+      // If Rate Limited (429), take a deep breath before hitting again
       if (resp.status === 429) {
-        await sleep(1500);
+        await sleep(3000 * (attempt + 1)); // Cool down
         continue;
       }
       
-      await sleep(1000);
+      await sleep(1500);
     } catch (err) {
       lastErrorLog = `Fetch Error: ${err.message}`;
-      await sleep(1000);
+      await sleep(1500);
     }
   }
 
@@ -178,8 +193,7 @@ async function handleGenerate(request) {
   const result = await generateFromRaphael(prompt.trim(), aspect, quantity);
 
   if (result && result._error) {
-    // AB UI PAR ASLI ERROR DIKHEGA
-    return Response.json({ error: `Raphael API Blocked us -> ${result._error}` }, { status: 502 });
+    return Response.json({ error: `API Error -> ${result._error}` }, { status: 502 });
   }
 
   if (!result || !result.images || result.images.length === 0) {
