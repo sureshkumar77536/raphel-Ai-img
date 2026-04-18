@@ -11,7 +11,7 @@ export default {
     }
 
     if (url.pathname === '/api/health') {
-      return Response.json({ ok: true, model: 'raphael-basic', version: '3.2-bypass-429' });
+      return Response.json({ ok: true, model: 'raphael-basic', version: '4.0-ultimate-bypass' });
     }
 
     if (request.method === 'POST' && url.pathname === '/api/generate') {
@@ -26,7 +26,6 @@ const USER_AGENTS = [
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36',
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36',
   'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36',
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0',
 ];
 
 function pickRandom(arr) {
@@ -40,8 +39,16 @@ function generateIPv4() {
   return `${a}.${octet()}.${octet()}.${octet()}`;
 }
 
+// Generate Random ID to trick anonymous tracking
+function generateUUID() {
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+    var r = Math.random() * 16 | 0, v = c === 'x' ? r : (r & 0x3 | 0x8);
+    return v.toString(16);
+  });
+}
+
 function createSession() {
-  return { ip: generateIPv4(), ua: pickRandom(USER_AGENTS), cookies: '' };
+  return { ip: generateIPv4(), ua: pickRandom(USER_AGENTS), cookies: '', deviceId: generateUUID() };
 }
 
 async function fetchWithTimeout(url, options, timeoutMs = 30000) {
@@ -66,21 +73,22 @@ function buildHeaders(session, extra = {}) {
     'Referer': 'https://raphael.app/',
     'Sec-Fetch-Dest': 'empty',
     'Sec-Fetch-Mode': 'cors',
-    'Sec-Fetch-Site': 'same-origin',
-    // Aggressive Spoofing Headers for WAF Bypass
+    'Sec-Fetch-Site': 'cross-site',
     'X-Forwarded-For': session.ip,
     'X-Real-IP': session.ip,
     'Client-IP': session.ip,
     'True-Client-IP': session.ip,
-    'CF-Connecting-IP': session.ip,
     ...(session.cookies ? { 'Cookie': session.cookies } : {}),
     ...extra,
   };
 }
 
-async function getFreshSession(session) {
+async function getFreshSession(session, useProxy = false) {
+  let target = 'https://raphael.app/';
+  if (useProxy) target = `https://corsproxy.io/?${encodeURIComponent(target)}`;
+
   try {
-    const resp = await fetchWithTimeout('https://raphael.app/', {
+    const resp = await fetchWithTimeout(target, {
       method: 'GET',
       headers: buildHeaders(session, { 'Accept': 'text/html,application/xhtml+xml' }),
     }, 15000);
@@ -99,22 +107,24 @@ async function getFreshSession(session) {
 }
 
 async function generateFromRaphael(prompt, aspect, quantity) {
-  const session = createSession();
+  let session = createSession();
   const maxRetries = 3;
   let lastErrorLog = "";
 
   for (let attempt = 0; attempt < maxRetries; attempt++) {
-    // If it's a retry, wipe identity completely to bypass WAF
+    // Agar pehli baar fail hua, toh proxy mode on kar do
+    const useProxy = attempt > 0; 
+    
     if (attempt > 0) {
-      session.ip = generateIPv4();
-      session.ua = pickRandom(USER_AGENTS);
-      session.cookies = '';
+      session = createSession(); // Pura identity badal do
     }
 
-    await getFreshSession(session);
+    await getFreshSession(session, useProxy);
 
-    // Cache buster to stop firewall from blocking repeated URLs
-    const targetUrl = `https://raphael.app/api/generate-image?_cb=${Date.now()}${Math.floor(Math.random() * 1000)}`;
+    let targetUrl = `https://raphael.app/api/generate-image?_cb=${Date.now()}`;
+    if (useProxy) {
+      targetUrl = `https://corsproxy.io/?${encodeURIComponent(targetUrl)}`;
+    }
 
     try {
       const resp = await fetchWithTimeout(targetUrl, {
@@ -127,6 +137,10 @@ async function generateFromRaphael(prompt, aspect, quantity) {
           number_of_images: Math.min(Math.max(parseInt(quantity) || 1, 1), 4),
           isSafeContent: true,
           autoTranslate: true,
+          // FAKE IDs to bypass payload tracking
+          device_id: session.deviceId,
+          client_id: session.deviceId,
+          anonymous_id: session.deviceId
         }),
       }, 45000);
 
@@ -164,13 +178,7 @@ async function generateFromRaphael(prompt, aspect, quantity) {
         lastErrorLog = `HTTP ${resp.status}: ${errText.substring(0, 100)}`;
       }
 
-      // If Rate Limited (429), take a deep breath before hitting again
-      if (resp.status === 429) {
-        await sleep(3000 * (attempt + 1)); // Cool down
-        continue;
-      }
-      
-      await sleep(1500);
+      await sleep(2000); // Cool down before retry
     } catch (err) {
       lastErrorLog = `Fetch Error: ${err.message}`;
       await sleep(1500);
