@@ -134,9 +134,14 @@ async function generateFromRaphael(prompt, aspect, quantity) {
         const text = await resp.text();
         const lines = text.trim().split('\n').filter(l => l.trim());
         const images = [];
+        
         for (const line of lines) {
           try {
-            const data = JSON.parse(line);
+            // FIX: Safely handles 'data: {json}' SSE format or standard NDJSON
+            const cleanLine = line.replace(/^data:\s*/, '').trim();
+            if (cleanLine === '[DONE]' || !cleanLine) continue;
+            
+            const data = JSON.parse(cleanLine);
             if (data.url) {
               images.push({
                 url: data.url.startsWith('http') ? data.url : `https://raphael.app${data.url}`,
@@ -147,6 +152,26 @@ async function generateFromRaphael(prompt, aspect, quantity) {
             }
           } catch {}
         }
+        
+        // FIX: Also checks if API responded with single JSON object instead of lines
+        if (images.length === 0) {
+          try {
+             const fallbackData = JSON.parse(text);
+             if (fallbackData.url) {
+               images.push({
+                  url: fallbackData.url.startsWith('http') ? fallbackData.url : `https://raphael.app${fallbackData.url}`,
+                  seed: fallbackData.seed || 0,
+                  width: fallbackData.width || 0,
+                  height: fallbackData.height || 0,
+               });
+             } else if (fallbackData.images) {
+                fallbackData.images.forEach(img => {
+                   if(img.url) images.push({ url: img.url.startsWith('http') ? img.url : `https://raphael.app${img.url}`, seed: img.seed||0 });
+                });
+             }
+          } catch {}
+        }
+
         if (images.length > 0) return images;
       }
 
