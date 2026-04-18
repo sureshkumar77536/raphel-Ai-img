@@ -11,7 +11,7 @@ export default {
     }
 
     if (url.pathname === '/api/health') {
-      return Response.json({ ok: true, model: 'raphael-basic', version: '4.0-ultimate-bypass' });
+      return Response.json({ ok: true, model: 'raphael-basic', version: '5.0-top-level' });
     }
 
     if (request.method === 'POST' && url.pathname === '/api/generate') {
@@ -26,6 +26,7 @@ const USER_AGENTS = [
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36',
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36',
   'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0'
 ];
 
 function pickRandom(arr) {
@@ -39,7 +40,6 @@ function generateIPv4() {
   return `${a}.${octet()}.${octet()}.${octet()}`;
 }
 
-// Generate Random ID to trick anonymous tracking
 function generateUUID() {
   return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
     var r = Math.random() * 16 | 0, v = c === 'x' ? r : (r & 0x3 | 0x8);
@@ -51,7 +51,7 @@ function createSession() {
   return { ip: generateIPv4(), ua: pickRandom(USER_AGENTS), cookies: '', deviceId: generateUUID() };
 }
 
-async function fetchWithTimeout(url, options, timeoutMs = 30000) {
+async function fetchWithTimeout(url, options, timeoutMs = 35000) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -77,18 +77,24 @@ function buildHeaders(session, extra = {}) {
     'X-Forwarded-For': session.ip,
     'X-Real-IP': session.ip,
     'Client-IP': session.ip,
-    'True-Client-IP': session.ip,
     ...(session.cookies ? { 'Cookie': session.cookies } : {}),
     ...extra,
   };
 }
 
-async function getFreshSession(session, useProxy = false) {
-  let target = 'https://raphael.app/';
-  if (useProxy) target = `https://corsproxy.io/?${encodeURIComponent(target)}`;
+// 🛡️ The Ultimate Free Proxy Router (corsproxy.io is completely removed)
+function getTargetUrl(basePath, routeIndex) {
+  const target = `https://raphael.app${basePath}`;
+  if (routeIndex === 0) return target; // Direct attack (Fake IP)
+  if (routeIndex === 1) return `https://corsproxy.org/?${encodeURIComponent(target)}`; // Proxy 1
+  if (routeIndex === 2) return `https://api.allorigins.win/raw?url=${encodeURIComponent(target)}`; // Proxy 2
+  return target;
+}
 
+async function getFreshSession(session, routeIndex) {
+  const targetUrl = getTargetUrl('/', routeIndex);
   try {
-    const resp = await fetchWithTimeout(target, {
+    const resp = await fetchWithTimeout(targetUrl, {
       method: 'GET',
       headers: buildHeaders(session, { 'Accept': 'text/html,application/xhtml+xml' }),
     }, 15000);
@@ -108,23 +114,16 @@ async function getFreshSession(session, useProxy = false) {
 
 async function generateFromRaphael(prompt, aspect, quantity) {
   let session = createSession();
-  const maxRetries = 3;
+  const maxRoutes = 3; // Hum 3 alag raste try karenge (Direct -> Proxy1 -> Proxy2)
   let lastErrorLog = "";
 
-  for (let attempt = 0; attempt < maxRetries; attempt++) {
-    // Agar pehli baar fail hua, toh proxy mode on kar do
-    const useProxy = attempt > 0; 
-    
-    if (attempt > 0) {
-      session = createSession(); // Pura identity badal do
-    }
+  for (let route = 0; route < maxRoutes; route++) {
+    // Har naye raste ke liye naya Fake Identity
+    session = createSession(); 
+    await getFreshSession(session, route);
 
-    await getFreshSession(session, useProxy);
-
-    let targetUrl = `https://raphael.app/api/generate-image?_cb=${Date.now()}`;
-    if (useProxy) {
-      targetUrl = `https://corsproxy.io/?${encodeURIComponent(targetUrl)}`;
-    }
+    const apiPath = `/api/generate-image?_cb=${Date.now()}`;
+    const targetUrl = getTargetUrl(apiPath, route);
 
     try {
       const resp = await fetchWithTimeout(targetUrl, {
@@ -137,12 +136,11 @@ async function generateFromRaphael(prompt, aspect, quantity) {
           number_of_images: Math.min(Math.max(parseInt(quantity) || 1, 1), 4),
           isSafeContent: true,
           autoTranslate: true,
-          // FAKE IDs to bypass payload tracking
           device_id: session.deviceId,
           client_id: session.deviceId,
           anonymous_id: session.deviceId
         }),
-      }, 45000);
+      }, 40000);
 
       if (resp.ok) {
         const text = await resp.text();
@@ -153,7 +151,6 @@ async function generateFromRaphael(prompt, aspect, quantity) {
           try {
             const cleanLine = line.replace(/^data:\s*/, '').trim();
             if (cleanLine === '[DONE]' || !cleanLine) continue;
-            
             const data = JSON.parse(cleanLine);
             if (data.url) {
               images.push({
@@ -175,12 +172,12 @@ async function generateFromRaphael(prompt, aspect, quantity) {
         if (images.length > 0) return { images };
       } else {
         const errText = await resp.text();
-        lastErrorLog = `HTTP ${resp.status}: ${errText.substring(0, 100)}`;
+        lastErrorLog = `HTTP ${resp.status} (Route ${route}): ${errText.substring(0, 80)}`;
       }
 
-      await sleep(2000); // Cool down before retry
+      await sleep(2000);
     } catch (err) {
-      lastErrorLog = `Fetch Error: ${err.message}`;
+      lastErrorLog = `Fetch Error (Route ${route}): ${err.message}`;
       await sleep(1500);
     }
   }
@@ -201,11 +198,11 @@ async function handleGenerate(request) {
   const result = await generateFromRaphael(prompt.trim(), aspect, quantity);
 
   if (result && result._error) {
-    return Response.json({ error: `API Error -> ${result._error}` }, { status: 502 });
+    return Response.json({ error: `API Blocks -> ${result._error}` }, { status: 502 });
   }
 
   if (!result || !result.images || result.images.length === 0) {
-    return Response.json({ error: 'No images returned from API.' }, { status: 502 });
+    return Response.json({ error: 'Generation failed. No images received.' }, { status: 502 });
   }
 
   return Response.json({ success: true, data: { images: result.images } });
